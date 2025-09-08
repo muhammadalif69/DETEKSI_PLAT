@@ -7,427 +7,468 @@ from ultralytics import YOLO
 import torch
 import easyocr
 import re
-from camera import rtsp_stream
 from threading import Thread, Lock
 import queue
-import io
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
-
-# ===================== KONFIGURASI =====================
-screen_w, screen_h = pyautogui.size()
-panel_w, panel_h = screen_w // 2, screen_h // 2
-TARGET_SIZE = (panel_w, panel_h)
+# ===================== KONFIGURASI UTAMA =====================
+layar_w, layar_h = pyautogui.size()
+panel_w, panel_h = layar_w // 2, layar_h // 2
+UKURAN_TARGET = (panel_w, panel_h)
 
 YOLO_MODEL_PATH = "data.pt"
-DETECTION_CLASSES = [2]  # kelas plat nomor
-TIMEOUT_SEC = 10
+KELAS_DETEKSI = [2]  # kelas plat nomor
+WAKTU_TIMEOUT = 10
 
-# Ukuran crop untuk OCR (slot preview kanan-bawah)
 CROP_W = int(panel_w * 0.7)
 CROP_H = int(panel_h * 0.3)
-OCR_SKIP = 15  # OCR dijalankan setiap 5 frame
+OCR_SKIP = 15  # OCR dijalankan setiap 15 frame
 
 API_HOST = "0.0.0.0"
 API_PORT = 8000
 
-# ------------------ DIGITAL ZOOM -----------------------
-ZOOM_FACTOR = 1.0   # default zoom (1.0 = no zoom)
-ZOOM_STEP = 0.1     # langkah saat menekan hotkey
-MIN_ZOOM = 1.0
-MAX_ZOOM = 3.0
-# =======================================================
+FAKTOR_ZOOM = [1.0, 1.0, 1.0, 1.0]  # Zoom per kamera
+LANGKAH_ZOOM = 0.1
+ZOOM_MIN = 1.0
+ZOOM_MAKS = 3.0
+kamera_terakhir_direset = None
+# ============================================================
 
-# ===================== GLOBAL STATE (shared with API) =====================
-latest_plate = ""          # teks plat hasil OCR terakhir (untuk API /plate)
-latest_plate_time = 0.0
-latest_frame = None        # combined frame (BGR numpy array) untuk API /frame
-state_lock = Lock()        # sinkronisasi akses shared state
-# =======================================================
+# ===================== KONFIGURASI KAMERA =====================
+KAMERA_LIST = [
+    {"ip": "192.168.1.18", "username": "admin", "password": "itinl123"},
+    {"ip": "192.168.1.61", "username": "admin", "password": "global123"},
+    {"ip": "192.168.1.64", "username": "admin", "password": "itinl2025"},
+    # Tambahkan kamera lain di sini
+]
+# ============================================================
 
+# ===================== VARIABEL GLOBAL =====================
+plat_terakhir = ""
+waktu_plat_terakhir = 0.0
+frame_terbaru = None
+frame_per_kamera = [None] * len(KAMERA_LIST)  # frame individual
+kunci_status = Lock()
+# ============================================================
 
 # ===================== FUNGSI PEMBANTU =====================
-def open_camera(cap):
-    if cap is None or not cap.isOpened():
-        print("[WARNING] FAILED TO OPEN CAMERA")
-        return None
+def buka_rtsp(ip: str, username: str, password: str, port: int = 554):
+    rtsp_url = f"rtsp://{username}:{password}@{ip}:{port}/Streaming/Channels/101"
+    print(f"[INFO] Membuka koneksi ke {rtsp_url}")
+    kamera = cv2.VideoCapture(rtsp_url)
+    if not kamera.isOpened():
+        print(f"[ERROR] Gagal koneksi ke kamera {ip} (cek username/password)")
+        raise ConnectionError(f"Gagal koneksi RTSP: {rtsp_url}")
+    return kamera
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, TARGET_SIZE[0])
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, TARGET_SIZE[1])
-    # try to reduce buffer
+def buka_kamera(kap):
+    if kap is None or not kap.isOpened():
+        print("[WARNING] Kamera gagal dibuka")
+        return None
+    kap.set(cv2.CAP_PROP_FRAME_WIDTH, UKURAN_TARGET[0])
+    kap.set(cv2.CAP_PROP_FRAME_HEIGHT, UKURAN_TARGET[1])
     try:
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        kap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
     except Exception:
         pass
     time.sleep(1)
-    return cap
+    return kap
 
+def buat_frame_kosong(teks="TIDAK ADA KAMERA"):
+    kosong = np.zeros((UKURAN_TARGET[1], UKURAN_TARGET[0], 3), dtype=np.uint8)
+    tulis_teks_tengah(kosong, teks, UKURAN_TARGET[0], UKURAN_TARGET[1],
+                      skala=2, warna=(0, 0, 255), tebal=4)
+    return kosong
 
-def create_blank_frame(text="NO CAMERA"):
-    blank = np.zeros((TARGET_SIZE[1], TARGET_SIZE[0], 3), dtype=np.uint8)
-    draw_centered_text(blank, text, TARGET_SIZE[0], TARGET_SIZE[1], scale=2, color=(0, 0, 255), thickness=4)
-    return blank
-
-def draw_centered_text(img, text, box_w, box_h, font=cv2.FONT_HERSHEY_SIMPLEX,
-                       scale=2, color=(0, 0, 255), thickness=4):
-    text_size, _ = cv2.getTextSize(text, font, scale, thickness)
-    text_w, text_h = text_size
-
-    # Hitung posisi agar teks berada di tengah
-    x = (box_w - text_w) // 2
-    y = (box_h + text_h) // 2  # +text_h agar baseline tepat di tengah
-
-    cv2.putText(img, text, (x, y), font, scale, color, thickness, cv2.LINE_AA)
+def tulis_teks_tengah(img, teks, box_w, box_h, font=cv2.FONT_HERSHEY_SIMPLEX,
+                      skala=2, warna=(0, 0, 255), tebal=4):
+    ukuran_teks, _ = cv2.getTextSize(teks, font, skala, tebal)
+    teks_w, teks_h = ukuran_teks
+    x = (box_w - teks_w) // 2
+    y = (box_h + teks_h) // 2
+    cv2.putText(img, teks, (x, y), font, skala, warna, tebal, cv2.LINE_AA)
     return img
 
-
-def crop(image, bbox):
+def potong_plat(gambar, bbox):
     x1, y1, x2, y2 = map(int, bbox)
-
-    # Safety bounds
-    h, w = image.shape[:2]
-    x1, x2 = np.clip([x1, x2], 0, w - 1)
-    y1, y2 = np.clip([y1, y2], 0, h - 1)
+    tinggi, lebar = gambar.shape[:2]
+    x1, x2 = np.clip([x1, x2], 0, lebar - 1)
+    y1, y2 = np.clip([y1, y2], 0, tinggi - 1)
     if x2 <= x1 or y2 <= y1:
         return None
-
-    # Crop gambar
-    crop_img = image[y1:y2, x1:x2]
-    if crop_img.size == 0:
+    potongan = gambar[y1:y2, x1:x2]
+    if potongan.size == 0:
         return None
+    abu = cv2.cvtColor(potongan, cv2.COLOR_BGR2GRAY)
+    return abu
 
-    # Konversi ke grayscale biasa
-    gray = cv2.cvtColor(crop_img, cv2.COLOR_BGR2GRAY)
-
-    return gray
-
-
-VALID_REGION_CODES = {
+KODE_WILAYAH_VALID = {
     "A","B","BA","BB","BD","BE","BG","BH","BK","BL","BM","BN","BP","D","DA",
     "DB","DC","DD","DE","DG","DH","DK","DL","DM","DN","DR","DS","DT","DU",
     "E","EB","ED","F","G","H","K","KB","KH","KT","KU","L","M","N","P","R",
     "S","T","V","W","Z"
 }
 
-
-def filter_plate_text(ocr_result):
-    plate_text = ""
-    for _, text, _ in ocr_result:
-        text_filtered = re.sub(r'[^A-Z0-9]', '', text.upper())
-        if len(text_filtered) > len(plate_text):
-            plate_text = text_filtered
-
-    if not plate_text:
+def bersihkan_hasil_ocr(hasil_ocr):
+    teks_plat = ""
+    for _, teks, _ in hasil_ocr:
+        teks_bersih = re.sub(r'[^A-Z0-9]', '', teks.upper())
+        if len(teks_bersih) > len(teks_plat):
+            teks_plat = teks_bersih
+    if not teks_plat:
         return ""
+    cocok = re.match(r"^([A-Z]{1,2})(\d{1,4})([A-Z]{0,3})$", teks_plat)
+    if cocok:
+        kode, nomor, akhiran = cocok.groups()
+        if kode not in KODE_WILAYAH_VALID:
+            return teks_plat
+        format_plat = f"{kode} {nomor}"
+        if akhiran:
+            format_plat += f" {akhiran}"
+        return format_plat
+    return teks_plat
+# ============================================================
 
-    match = re.match(r"^([A-Z]{1,2})(\d{1,4})([A-Z]{0,3})$", plate_text)
-    if match:
-        region, number, suffix = match.groups()
-        if region not in VALID_REGION_CODES:
-            return plate_text
-
-        formatted = f"{region} {number}"
-        if suffix:
-            formatted += f" {suffix}"
-        return formatted
-
-    return plate_text
-# =======================================================
-
-
-# ===================== INISIALISASI MODEL & OCR =====================
+# ===================== INISIALISASI =====================
 device = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[INFO] DEVICE USE: {device}")
+print(f"[INFO] Perangkat yang digunakan: {device}")
 
-# Muat model YOLO (pastikan path benar)
 model = YOLO(YOLO_MODEL_PATH).to(device)
+pembaca_ocr = easyocr.Reader(['en'], gpu=(device == "cuda"))
 
-# OCR
-reader = easyocr.Reader(['en'], gpu=(device == "cuda"))
+sumber_kamera = [buka_rtsp(kam["ip"], kam["username"], kam["password"]) for kam in KAMERA_LIST]
+kamera_caps = [buka_kamera(kap) for kap in sumber_kamera]
+kamera_aktif = [kap is not None for kap in kamera_caps]
+waktu_frame_terakhir = [time.time()] * len(sumber_kamera)
 
-# Setup kamera (sesuaikan ip/credentials di rtsp_stream)
-camera_sources = [rtsp_stream("192.168.1.61", "101")]
-caps = [open_camera(cap) for cap in camera_sources]
-last_frame_times = [time.time()] * len(camera_sources)
-camera_active = [cap is not None for cap in caps]
+riwayat_fps = collections.deque(maxlen=30)
+waktu_fps_sebelumnya = time.time()
 
-fps_history = collections.deque(maxlen=30)
-prev_fps_time = time.time()
+antrian_ocr = queue.Queue()
+cache_hasil_ocr = ""
+jumlah_frame = 0
+# ============================================================
 
-ocr_queue = queue.Queue()
-ocr_result_cache = ""  # cache teks untuk overlay
-frame_count = 0
-# =======================================================
-
-
-def ocr_worker():
-    global ocr_result_cache, latest_plate, latest_plate_time
+# ===================== WORKER OCR =====================
+def pekerja_ocr():
+    global cache_hasil_ocr, plat_terakhir, waktu_plat_terakhir
     while True:
-        crop_img = ocr_queue.get()
-        if crop_img is None:
+        gambar_crop = antrian_ocr.get()
+        if gambar_crop is None:
             break
+        diproses = cv2.resize(gambar_crop, (0, 0), fx=2.0, fy=2.0)
+        diproses = cv2.GaussianBlur(diproses, (3, 3), 0)
+        _, diproses = cv2.threshold(diproses, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        hasil = pembaca_ocr.readtext(diproses)
+        if hasil:
+            bersih = bersihkan_hasil_ocr(hasil)
+            if bersih:
+                with kunci_status:
+                    cache_hasil_ocr = bersih
+                    plat_terakhir = bersih
+                    waktu_plat_terakhir = time.time()
 
-        # Perbesar agar OCR lebih akurat
-        processed = cv2.resize(crop_img, (0, 0), fx=2.0, fy=2.0)
-        processed = cv2.GaussianBlur(processed, (3, 3), 0)
-        _, processed = cv2.threshold(processed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+Thread(target=pekerja_ocr, daemon=True).start()
+# ============================================================
 
-        result = reader.readtext(processed)
-
-        if result:
-            filtered = filter_plate_text(result)
-            if filtered:
-                with state_lock:
-                    ocr_result_cache = filtered    # untuk overlay
-                    latest_plate = filtered        # untuk API /plate
-                    latest_plate_time = time.time()
-
-
-# Jalankan OCR worker
-Thread(target=ocr_worker, daemon=True).start()
-
-
-# ===================== FASTAPI (dijalankan di thread) =====================
-app = FastAPI(title="PLATE API)")
+# ===================== API FASTAPI =====================
+app = FastAPI(title="API DETEKSI PLAT")
 
 @app.get("/")
 def root():
-    return {"message": "PLATE API RUNNING", "device": device}
+    return {"pesan": "API DETEKSI PLAT AKTIF", "device": device}
 
-@app.get("/health")
-def health():
-    # cek model & kamera minimal
-    cam_status = all(camera_active)
-    return {"ok": True, "model_loaded": model is not None, "camera_connected": cam_status}
+@app.get("/kesehatan")
+def kesehatan():
+    status_kamera = all(kamera_aktif)
+    return {"ok": True, "model_terload": model is not None, "kamera_terhubung": status_kamera}
 
-@app.get("/plate")
-def get_plate():
-    with state_lock:
-        if not latest_plate:
-            return JSONResponse(status_code=404, content={"error": "No plate read yet"})
-        return {"plate": latest_plate, "timestamp": latest_plate_time}
+@app.get("/plat")
+def ambil_plat():
+    with kunci_status:
+        if not plat_terakhir:
+            return JSONResponse(status_code=404, content={"error": "Belum ada plat terbaca"})
+        return {"plat": plat_terakhir, "timestamp": waktu_plat_terakhir}
 
-@app.get("/frame")
-def get_frame():
-    with state_lock:
-        frame = latest_frame.copy() if latest_frame is not None else None
+# Endpoint gabungan 4 kamera
+@app.get("/video")
+def stream_video():
+    def hasil():
+        while True:
+            with kunci_status:
+                frame = frame_terbaru.copy() if frame_terbaru is not None else None
+            if frame is None:
+                continue
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" +
+                   bytearray(buffer) +
+                   b"\r\n")
+    return StreamingResponse(hasil(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-    if frame is None:
-        return JSONResponse(status_code=404, content={"error": "No frame available yet"})
+# Endpoint per kamera
+@app.get("/video/{kamera_id}")
+def stream_video_per_kamera(kamera_id: int):
+    if kamera_id < 1 or kamera_id > len(KAMERA_LIST):
+        return JSONResponse(status_code=404, content={"error": "Kamera tidak ditemukan"})
+    
+    def hasil():
+        while True:
+            with kunci_status:
+                frame = frame_per_kamera[kamera_id - 1]
+            if frame is None:
+                continue
+            ret, buf = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            yield (b"--frame\r\n"
+                   b"Content-Type: image/jpeg\r\n\r\n" +
+                   bytearray(buf) +
+                   b"\r\n")
+    
+    return StreamingResponse(hasil(), media_type="multipart/x-mixed-replace; boundary=frame")
 
-    # encode to jpeg
-    ret, buf = cv2.imencode('.jpg', frame)
-    if not ret:
-        raise HTTPException(status_code=500, detail="Failed to encode frame")
-    return Response(content=buf.tobytes(), media_type="image/jpeg")
-
-
-def start_api_in_thread():
+def mulai_api_dalam_thread():
     def _run():
         uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="info")
     t = Thread(target=_run, daemon=True)
     t.start()
-    print(f"[INFO] API server starting at http://{API_HOST}:{API_PORT}/")
+    print(f"[INFO] API berjalan di http://{API_HOST}:{API_PORT}/")
+# ============================================================
 
-
-# =======================================================
-# ===================== LOOP UTAMA =======================
-# =======================================================
-def main_loop():
-    global frame_count, ocr_result_cache, latest_frame, prev_fps_time, ZOOM_FACTOR
+# ===================== LOOP UTAMA =====================
+def loop_utama():
+    global jumlah_frame, cache_hasil_ocr, frame_terbaru, waktu_fps_sebelumnya, FAKTOR_ZOOM, kamera_terakhir_direset
 
     while True:
-        frames = []
-        current_time = time.time()
-        frame_count += 1
+        frame_semua = []
+        waktu_saat_ini = time.time()
+        jumlah_frame += 1
 
-        for idx, cap in enumerate(caps):
-            # Reconnect jika kamera mati
-            if not camera_active[idx]:
+        for idx, kap in enumerate(kamera_caps):
+            # Reconnect kamera jika mati
+            if not kamera_aktif[idx]:
                 try:
-                    cap = rtsp_stream("192.168.1.61", "101")
-                    cap = open_camera(cap)
-                    caps[idx] = cap
-                    camera_active[idx] = True
-                    last_frame_times[idx] = current_time
+                    kap = buka_rtsp(
+                        KAMERA_LIST[idx]["ip"],
+                        KAMERA_LIST[idx]["username"],
+                        KAMERA_LIST[idx]["password"]
+                    )
+                    kap = buka_kamera(kap)
+                    kamera_caps[idx] = kap
+                    kamera_aktif[idx] = True
+                    waktu_frame_terakhir[idx] = waktu_saat_ini
                 except Exception:
-                    frames.append(create_blank_frame(f"Camera {idx+1}: No Camera"))
+                    frame_semua.append(buat_frame_kosong(f"Kamera {idx+1}: Tidak Aktif"))
                     continue
 
-            # Baca frame
-            ret, frame = cap.read()
+            # Ambil frame kamera
+            ret, frame = kap.read()
             if not ret or frame is None:
                 print(f"[WARNING] Kamera {idx+1} tidak mengirim frame.")
-                camera_active[idx] = False
-                if cap:
-                    cap.release()
-                caps[idx] = None
-                frames.append(create_blank_frame(f"Camera {idx+1}: No Camera"))
+                kamera_aktif[idx] = False
+                if kap:
+                    kap.release()
+                kamera_caps[idx] = None
+                frame_semua.append(buat_frame_kosong(f"Kamera {idx+1}: Tidak Aktif"))
                 continue
 
-            last_frame_times[idx] = current_time
+            waktu_frame_terakhir[idx] = waktu_saat_ini
 
-            # === Digital Zoom (crop tengah lalu resize) ===
-            if ZOOM_FACTOR > 1.0:
+            # Zoom per kamera
+            if FAKTOR_ZOOM[idx] > 1.0:
                 try:
-                    h, w = frame.shape[:2]
-                    new_w = int(w / ZOOM_FACTOR)
-                    new_h = int(h / ZOOM_FACTOR)
-                    # Pastikan minimal 2x2 crop
-                    new_w = max(2, new_w)
-                    new_h = max(2, new_h)
-                    x1 = max(0, w // 2 - new_w // 2)
-                    y1 = max(0, h // 2 - new_h // 2)
-                    x2 = min(w, x1 + new_w)
-                    y2 = min(h, y1 + new_h)
-                    cropped = frame[y1:y2, x1:x2]
-                    if cropped.size != 0:
-                        frame = cv2.resize(cropped, (w, h))
+                    tinggi, lebar = frame.shape[:2]
+                    baru_w = int(lebar / FAKTOR_ZOOM[idx])
+                    baru_h = int(tinggi / FAKTOR_ZOOM[idx])
+                    x1 = max(0, lebar // 2 - baru_w // 2)
+                    y1 = max(0, tinggi // 2 - baru_h // 2)
+                    x2 = min(lebar, x1 + baru_w)
+                    y2 = min(tinggi, y1 + baru_h)
+                    terpotong = frame[y1:y2, x1:x2]
+                    if terpotong.size != 0:
+                        frame = cv2.resize(terpotong, (lebar, tinggi))
                 except Exception as e:
-                    print("[WARNING] Zoom error:", e)
+                    print("[WARNING] Error zoom:", e)
 
-            # YOLO inference
+            # Jalankan YOLO
             try:
-                results_gen = model(frame, classes=DETECTION_CLASSES, device=device, stream=True)
-                result = next(results_gen)
+                hasil_deteksi_gen = model(frame, classes=KELAS_DETEKSI, device=device, stream=True, verbose=False)
+                hasil_deteksi = next(hasil_deteksi_gen)
             except StopIteration:
-                result = None   
+                hasil_deteksi = None
             except Exception as e:
-                print("[ERROR] YOLO inference error:", e)
-                result = None
+                print("[ERROR] YOLO gagal:", e)
+                hasil_deteksi = None
 
-            annotated = frame.copy()
-            if result is not None:
+            frame_annotasi = frame.copy()
+            if hasil_deteksi is not None:
                 try:
-                    annotated = result.plot()
+                    frame_annotasi = hasil_deteksi.plot()
                 except Exception:
-                    annotated = frame.copy()
+                    frame_annotasi = frame.copy()
 
-            # Crop & OCR plat (default: no plate)
-            slot_crop = np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8)
-            draw_centered_text(slot_crop, "No Plate", CROP_W, CROP_H,
-                   font=cv2.FONT_HERSHEY_SIMPLEX, scale=1.5, color=(0, 0, 255), thickness=3)
+            # OCR plat nomor
+            crop_slot = np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8)
+            tulis_teks_tengah(crop_slot, "Tidak Ada Plat", CROP_W, CROP_H,
+                               font=cv2.FONT_HERSHEY_SIMPLEX, skala=1.5,
+                               warna=(0, 0, 255), tebal=3)
 
-            found_plate_in_this_frame = False
+            plat_ditemukan = False
 
-            if result is not None and len(result.boxes) > 0:
-                for box in result.boxes:
-                    cls = int(box.cls.cpu().item())
-                    if cls in DETECTION_CLASSES:
-                        coords = box.xyxy[0].cpu().numpy()
-                        crop_plate = crop(annotated, coords)
-
-                        if crop_plate is not None:
-                            # tampilan untuk slot (convert to BGR)
+            if hasil_deteksi is not None and len(hasil_deteksi.boxes) > 0:
+                for kotak in hasil_deteksi.boxes:
+                    cls = int(kotak.cls.cpu().item())
+                    if cls in KELAS_DETEKSI:
+                        koordinat = kotak.xyxy[0].cpu().numpy()
+                        crop_plat = potong_plat(frame_annotasi, koordinat)
+                        if crop_plat is not None:
                             try:
-                                slot_crop = cv2.resize(cv2.cvtColor(crop_plate, cv2.COLOR_GRAY2BGR), (CROP_W, CROP_H))
+                                crop_slot = cv2.resize(cv2.cvtColor(crop_plat, cv2.COLOR_GRAY2BGR), (CROP_W, CROP_H))
                             except Exception:
-                                try:
-                                    slot_crop = cv2.resize(np.stack([crop_plate]*3, axis=-1), (CROP_W, CROP_H))
-                                except Exception:
-                                    slot_crop = np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8)
+                                crop_slot = np.zeros((CROP_H, CROP_W, 3), dtype=np.uint8)
+                            if jumlah_frame % OCR_SKIP == 0:
+                                antrian_ocr.put(crop_plat)
+                            plat_ditemukan = True
+                            break
 
-                            # Kirim grayscale langsung ke OCR tiap OCR_SKIP frame
-                            if frame_count % OCR_SKIP == 0:
-                                ocr_queue.put(crop_plate)
+            if not plat_ditemukan:
+                with kunci_status:
+                    cache_hasil_ocr = ""
+                    plat_terakhir = ""
 
-                            found_plate_in_this_frame = True
-                            break  # ambil satu plat pertama saja
+            # Tempel hasil OCR di frame
+            tinggi, lebar = frame_annotasi.shape[:2]
+            if CROP_H + 20 < tinggi and CROP_W + 20 < lebar:
+                y1, y2 = tinggi - CROP_H - 10, tinggi - 10
+                x1, x2 = lebar - CROP_W - 10, lebar - 10
+                frame_annotasi[y1:y2, x1:x2] = crop_slot
 
-            # === RESET OCR jika tidak ada deteksi pada frame ini ===
-            if not found_plate_in_this_frame:
-                with state_lock:
-                    ocr_result_cache = ""
-                    latest_plate = ""
-                    # latest_plate_time tidak diubah
+            with kunci_status:
+                hasil_cache = cache_hasil_ocr
+                frame_per_kamera[idx] = cv2.resize(frame_annotasi, UKURAN_TARGET)  # Simpan frame per kamera
 
-            # Tempel hasil crop ke frame annotated (preview pojok kanan bawah)
-            h, w = annotated.shape[:2]
-            if CROP_H + 20 < h and CROP_W + 20 < w:
-                y1, y2 = h - CROP_H - 10, h - 10
-                x1, x2 = w - CROP_W - 10, w - 10
-                annotated[y1:y2, x1:x2] = slot_crop
-
-            # Tampilkan hasil OCR (shared cache)
-            with state_lock:
-                cached = ocr_result_cache
-
-            text_to_show = cached if cached else "-"
-            cv2.putText(annotated, f"Plate: {text_to_show}", (10, h - 20),
+            teks_tampil = hasil_cache if hasil_cache else "-"
+            cv2.putText(frame_annotasi, f"Plat: {teks_tampil}", (10, tinggi - 20),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2,
-                        (0, 255, 0) if cached else (0, 0, 255), 3)
+                        (0, 255, 0) if hasil_cache else (0, 0, 255), 3)
 
-            cv2.putText(annotated, f"Camera {idx+1} (Zoom: {ZOOM_FACTOR:.1f}x)", (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 0), 3)
+            cv2.putText(frame_annotasi, f"Kamera {idx+1} (Zoom: {FAKTOR_ZOOM[idx]:.1f}x)", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
 
-            frames.append(cv2.resize(annotated, TARGET_SIZE))
+            frame_semua.append(cv2.resize(frame_annotasi, UKURAN_TARGET))
 
-            # Timeout kamera
-            if current_time - last_frame_times[idx] > TIMEOUT_SEC:
+            # Kamera timeout
+            if waktu_saat_ini - waktu_frame_terakhir[idx] > WAKTU_TIMEOUT:
                 print(f"[INFO] Kamera {idx+1} timeout.")
-                camera_active[idx] = False
-                if cap:
-                    cap.release()
-                caps[idx] = None
+                kamera_aktif[idx] = False
+                if kap:
+                    kap.release()
+                kamera_caps[idx] = None
 
-        # Lengkapi frame jadi 4 panel
-        while len(frames) < 4:
-            frames.append(create_blank_frame())
-
-        top_row = np.hstack(frames[:2])
-        bottom_row = np.hstack(frames[2:4])
-        combined = np.vstack([top_row, bottom_row])
+        # Gabungan untuk window utama
+        while len(frame_semua) < 4:
+            frame_semua.append(buat_frame_kosong())
+        baris_atas = np.hstack(frame_semua[:2])
+        baris_bawah = np.hstack(frame_semua[2:4])
+        gabungan = np.vstack([baris_atas, baris_bawah])
+        with kunci_status:
+            frame_terbaru = gabungan.copy()
 
         # Hitung FPS
-        now = time.time()
-        dt = now - prev_fps_time
+        sekarang = time.time()
+        dt = sekarang - waktu_fps_sebelumnya
         fps = 1.0 / (dt + 1e-6)
-        fps_history.append(fps)
-        prev_fps_time = now
+        riwayat_fps.append(fps)
+        waktu_fps_sebelumnya = sekarang
 
-        # Update shared latest_frame
-        with state_lock:
-            latest_frame = combined.copy()
+        with kunci_status:
+            frame_terbaru = gabungan.copy()
 
-        # Tampilkan hasil
-        cv2.namedWindow("Multi Camera Detection", cv2.WND_PROP_FULLSCREEN)
+        cv2.namedWindow("Deteksi Multi Kamera", cv2.WND_PROP_FULLSCREEN)
         try:
-            cv2.setWindowProperty("Multi Camera Detection", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+            cv2.setWindowProperty("Deteksi Multi Kamera", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
         except Exception:
             pass
-        cv2.imshow("Multi Camera Detection", combined)
+        cv2.imshow("Deteksi Multi Kamera", gabungan)
 
-        # Keyboard handling (hotkeys untuk zoom & exit)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        tombol = cv2.waitKey(1) & 0xFF
+        if tombol == 27:  # ESC keluar
             break
-        elif key == ord('z'):
-            ZOOM_FACTOR = min(MAX_ZOOM, round((ZOOM_FACTOR + ZOOM_STEP) * 10) / 10.0)
-            print(f"[INFO] Zoom set to {ZOOM_FACTOR:.1f}x")
-        elif key == ord('x'):
-            ZOOM_FACTOR = max(MIN_ZOOM, round((ZOOM_FACTOR - ZOOM_STEP) * 10) / 10.0)
-            print(f"[INFO] Zoom set to {ZOOM_FACTOR:.1f}x")
-        elif key == ord('r'):
-            ZOOM_FACTOR = 1.0
-            print("[INFO] Zoo m reset to 1.0x")
-    # end while
+        # Zoom in per kamera
+        elif tombol == ord('1'):
+            if 0 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[0] = min(ZOOM_MAKS, FAKTOR_ZOOM[0] + LANGKAH_ZOOM)
+        elif tombol == ord('2'):
+            if 1 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[1] = min(ZOOM_MAKS, FAKTOR_ZOOM[1] + LANGKAH_ZOOM)
+        elif tombol == ord('3'):
+            if 2 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[2] = min(ZOOM_MAKS, FAKTOR_ZOOM[2] + LANGKAH_ZOOM)
+        elif tombol == ord('4'):
+            if 3 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[3] = min(ZOOM_MAKS, FAKTOR_ZOOM[3] + LANGKAH_ZOOM)
+        elif tombol == ord('0'):  # Zoom in semua kamera
+            for i in range(len(KAMERA_LIST)):
+                if i < len(FAKTOR_ZOOM):
+                    FAKTOR_ZOOM[i] = min(ZOOM_MAKS, FAKTOR_ZOOM[i] + LANGKAH_ZOOM)
+
+        # Zoom out per kamera (Shift + angka -> simbol)
+        elif tombol == ord('!'):  # Shift+1
+            if 0 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[0] = max(ZOOM_MIN, FAKTOR_ZOOM[0] - LANGKAH_ZOOM)
+                kamera_terakhir_direset = 0
+        elif tombol == ord('@'):  # Shift+2
+            if 1 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[1] = max(ZOOM_MIN, FAKTOR_ZOOM[1] - LANGKAH_ZOOM)
+                kamera_terakhir_direset = 1
+        elif tombol == ord('#'):  # Shift+3
+            if 2 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[2] = max(ZOOM_MIN, FAKTOR_ZOOM[2] - LANGKAH_ZOOM)
+                kamera_terakhir_direset = 2
+        elif tombol == ord('$'):  # Shift+4
+            if 3 < len(FAKTOR_ZOOM):
+                FAKTOR_ZOOM[3] = max(ZOOM_MIN, FAKTOR_ZOOM[3] - LANGKAH_ZOOM)
+                kamera_terakhir_direset = 3
+        elif tombol == ord(')'):  # Shift+0 -> zoom out semua
+            for i in range(len(KAMERA_LIST)):
+                if i < len(FAKTOR_ZOOM):
+                    FAKTOR_ZOOM[i] = max(ZOOM_MIN, FAKTOR_ZOOM[i] - LANGKAH_ZOOM)
+            kamera_terakhir_direset = 'semua'
+
+        # Reset zoom (tekan 'r' setelah Shift+angka untuk mereset kamera yang terakhir di-shift)
+        elif tombol == ord('r') and kamera_terakhir_direset is not None:
+            if kamera_terakhir_direset == 'semua':
+                for i in range(len(KAMERA_LIST)):
+                    if i < len(FAKTOR_ZOOM):
+                        FAKTOR_ZOOM[i] = 1.0
+            else:
+                idx_reset = kamera_terakhir_direset
+                if isinstance(idx_reset, int) and idx_reset < len(FAKTOR_ZOOM):
+                    FAKTOR_ZOOM[idx_reset] = 1.0
+            kamera_terakhir_direset = None
+
+    # Akhir while loop utama
 
 
+# ===================== ENTRYPOINT =====================
 if __name__ == "__main__":
-    # Start API in background
-    start_api_in_thread()
-
-    # Run main GUI loop in main thread
+    mulai_api_dalam_thread()
     try:
-        main_loop()
+        loop_utama()
     finally:
-        # cleanup
-        for cap in caps:
-            if cap:
-                cap.release()
+        # Tutup semua koneksi kamera dan worker OCR dengan rapi
+        for kap in kamera_caps:
+            if kap:
+                try:
+                    kap.release()
+                except Exception:
+                    pass
         cv2.destroyAllWindows()
-        # stop OCR worker
-        ocr_queue.put(None)
-        print("[INFO] Exiting")
+        # hentikan worker OCR
+        antrian_ocr.put(None)
+        print("[INFO] Keluar, semua resource dilepas.")
